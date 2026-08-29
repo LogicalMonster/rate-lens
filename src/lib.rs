@@ -1,4 +1,5 @@
 mod catalog;
+mod exchange;
 mod parser;
 mod pricing;
 mod probe;
@@ -6,6 +7,10 @@ mod probe;
 pub use catalog::{
     ANTHROPIC_PRICING_SOURCE, CATALOG_AS_OF, CatalogError, CatalogModel, OPENAI_PRICING_SOURCE,
     PriceTier, ResolvedPricing, catalog_models, resolve_pricing,
+};
+pub use exchange::{
+    EXCHANGE_RATE_SOURCE, ExchangeRateError, ExchangeRateQuote, fetch_usd_exchange_rate,
+    normalize_currency,
 };
 pub use parser::{ParseError, ParseReport, ProtocolHint, parse_usage};
 pub use pricing::{

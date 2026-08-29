@@ -2,7 +2,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rate_lens::{
     Analysis, AnthropicThinkingMode, AuthStyle, CATALOG_AS_OF, ParseReport, PriceTier, Pricing,
     ProbeConfig, Protocol, ProtocolHint, ResolvedPricing, TokenCost, analyze_usage, catalog_models,
-    list_models, parse_usage, resolve_pricing, run_probe,
+    fetch_usd_exchange_rate, list_models, normalize_currency, parse_usage, resolve_pricing,
+    run_probe,
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -60,7 +61,7 @@ struct ProbeArgs {
     #[arg(long, default_value_t = 1_000)]
     context_tokens: u64,
 
-    /// 推理深度；OpenAI 常见值：none/minimal/low/medium/high/xhigh/max
+    /// 推理深度，原样发给服务端；OpenAI 可见 none/minimal/low/medium/high/xhigh/max
     #[arg(long)]
     reasoning: Option<String>,
 
@@ -595,24 +596,25 @@ fn run_wizard() -> Result<(), Box<dyn std::error::Error>> {
     };
     let official_model = prompt("官方对照模型（回车沿用中转模型 ID）", &model)?;
     let context_tokens = parse_prompt::<u64>("目标输入 token", "1000")?;
-    let reasoning = prompt("推理深度（none/low/medium/high；空值=不发送）", "")?;
+    let reasoning = prompt_reasoning_effort(protocol)?;
     let max_output_tokens = parse_prompt::<u64>("最大输出 token", "64")?;
-    let exchange_rate = parse_prompt::<Decimal>("1 USD 对应扣费币种数量", "1")?;
-    let actual_currency = prompt("扣费币种", "USD")?;
+    let actual_currency = prompt_actual_currency()?;
+    let exchange_rate = prompt_exchange_rate(&actual_currency)?;
 
-    let (pricing, metadata, warnings) = resolve_requested_pricing(
+    let (estimated_pricing, _, _) = resolve_requested_pricing(
         protocol,
         &official_model,
         context_tokens,
         PriceTier::Auto,
         ManualRates::empty(),
     )?;
-    let pricing = pricing.ok_or("内置目录无法匹配官方模型；请改用 probe 命令并手工传入价格")?;
+    let estimated_pricing =
+        estimated_pricing.ok_or("内置目录无法匹配官方模型；请改用 probe 命令并手工传入价格")?;
     eprintln!(
         "\n预计输入成本约 {} USD（最终按响应 usage 计算）。",
         money(rate_lens::approximate_official_input_cost(
             context_tokens,
-            pricing.uncached_input_per_million
+            estimated_pricing.uncached_input_per_million
         ))
     );
     let confirmed = prompt("确认发起请求？[y/N]", "n")?;
@@ -627,7 +629,7 @@ fn run_wizard() -> Result<(), Box<dyn std::error::Error>> {
         auth_style,
         model,
         context_tokens,
-        reasoning_effort: normalize_reasoning(protocol, Some(reasoning)),
+        reasoning_effort: reasoning,
         max_output_tokens,
         anthropic_thinking_mode: AnthropicThinkingMode::Adaptive,
         thinking_budget_tokens: 1_024,
@@ -635,7 +637,14 @@ fn run_wizard() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let charged_text = prompt("本次中转实际扣费（可留空，只查看官方价）", "")?;
     let charged = parse_optional_decimal(&charged_text)?;
-    let mut all_warnings = warnings;
+    let (pricing, metadata, mut all_warnings) = resolve_requested_pricing(
+        protocol,
+        &official_model,
+        result.report.usage.total_input_tokens(),
+        PriceTier::Auto,
+        ManualRates::empty(),
+    )?;
+    let pricing = pricing.ok_or("无法按实际 usage 确定官方价格")?;
     all_warnings.extend(result.warnings);
     append_usage_warnings(&result.report.usage, &mut all_warnings);
     let analysis = analyze_usage(result.report.usage, pricing, charged, exchange_rate)?;
@@ -1019,6 +1028,140 @@ fn parse_optional_decimal(value: &str) -> Result<Option<Decimal>, rust_decimal::
     } else {
         Decimal::from_str(value).map(Some)
     }
+}
+
+fn prompt_reasoning_effort(
+    protocol: Protocol,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let (title, options, default) = match protocol {
+        Protocol::OpenAiResponses => (
+            "OpenAI 推理深度",
+            vec![
+                ("不发送 reasoning 参数", None),
+                ("none", Some("none")),
+                ("minimal", Some("minimal")),
+                ("low", Some("low")),
+                ("medium", Some("medium")),
+                ("high", Some("high")),
+                ("xhigh", Some("xhigh")),
+                ("max", Some("max")),
+            ],
+            "1",
+        ),
+        Protocol::AnthropicMessages => (
+            "Anthropic adaptive thinking effort",
+            vec![
+                ("关闭 thinking", None),
+                ("low", Some("low")),
+                ("medium", Some("medium")),
+                ("high", Some("high")),
+                ("max", Some("max")),
+            ],
+            "1",
+        ),
+    };
+    eprintln!("\n{title}（具体支持范围由模型决定）：");
+    for (index, (label, _)) in options.iter().enumerate() {
+        eprintln!("  {}. {label}", index + 1);
+    }
+    eprintln!("  {}. 自定义值", options.len() + 1);
+    loop {
+        let answer = prompt("选择编号", default)?;
+        if let Ok(index) = answer.parse::<usize>() {
+            if let Some((_, value)) = index.checked_sub(1).and_then(|index| options.get(index)) {
+                return Ok(value.map(str::to_owned));
+            }
+            if index == options.len() + 1 {
+                let custom = prompt("自定义 effort", "")?;
+                if !custom.trim().is_empty() {
+                    return Ok(Some(custom.trim().to_owned()));
+                }
+            }
+        }
+        eprintln!("请输入列表中的编号。");
+    }
+}
+
+fn prompt_actual_currency() -> Result<String, Box<dyn std::error::Error>> {
+    const CURRENCIES: &[(&str, &str)] = &[
+        ("USD", "美元"),
+        ("CNY", "人民币"),
+        ("HKD", "港币"),
+        ("TWD", "新台币"),
+        ("EUR", "欧元"),
+        ("JPY", "日元"),
+        ("GBP", "英镑"),
+        ("SGD", "新加坡元"),
+    ];
+    eprintln!("\n中转站扣费币种：");
+    for (index, (code, name)) in CURRENCIES.iter().enumerate() {
+        eprintln!("  {}. {code}（{name}）", index + 1);
+    }
+    eprintln!("  {}. 自定义 ISO 4217 币种", CURRENCIES.len() + 1);
+    eprintln!("  {}. 站内额度/非货币单位", CURRENCIES.len() + 2);
+    loop {
+        let answer = prompt("选择编号", "1")?;
+        if let Ok(index) = answer.parse::<usize>() {
+            if let Some((code, _)) = index.checked_sub(1).and_then(|index| CURRENCIES.get(index)) {
+                return Ok((*code).to_owned());
+            }
+            if index == CURRENCIES.len() + 1 {
+                let currency = prompt("三位币种代码", "")?;
+                match normalize_currency(&currency) {
+                    Ok(currency) => return Ok(currency),
+                    Err(error) => eprintln!("{error}"),
+                }
+                continue;
+            }
+            if index == CURRENCIES.len() + 2 {
+                let unit = prompt("额度单位名称", "QUOTA")?;
+                if !unit.trim().is_empty() {
+                    return Ok(unit.trim().to_ascii_uppercase());
+                }
+            }
+        }
+        eprintln!("请输入列表中的编号。");
+    }
+}
+
+fn prompt_exchange_rate(actual_currency: &str) -> Result<Decimal, Box<dyn std::error::Error>> {
+    if actual_currency == "USD" {
+        eprintln!("1 USD = 1 USD。");
+        return Ok(Decimal::ONE);
+    }
+
+    let reference = if normalize_currency(actual_currency).is_ok() {
+        eprintln!("正在查询 USD/{actual_currency} 市场参考汇率……");
+        match fetch_usd_exchange_rate(actual_currency, 10) {
+            Ok(quote) => {
+                let date = quote
+                    .date
+                    .as_deref()
+                    .map(|date| format!("，日期 {date}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "参考：1 USD ≈ {} {}（{}{}）",
+                    compact(quote.rate, 8),
+                    quote.quote,
+                    quote.source,
+                    date
+                );
+                Some(quote.rate)
+            }
+            Err(error) => {
+                eprintln!("参考汇率获取失败：{error}");
+                None
+            }
+        }
+    } else {
+        eprintln!("站内额度没有公开市场汇率，请按中转站规则填写。");
+        None
+    };
+    eprintln!("市场参考值不一定等于中转站结算汇率，可直接覆盖。");
+    let default = reference
+        .map(|rate| compact(rate, 8))
+        .unwrap_or_else(|| "1".to_owned());
+    parse_prompt::<Decimal>(&format!("1 USD 对应多少 {actual_currency}"), &default)
 }
 
 fn normalize_reasoning(protocol: Protocol, value: Option<String>) -> Option<String> {

@@ -25,7 +25,7 @@ cargo install --path .
 rate-lens
 ```
 
-向导会依次询问协议、`base_url`、API Key、模型、官方对照模型、上下文长度和推理深度。API Key 使用隐藏输入，不会写入命令历史。发送真实请求前会展示预估输入成本并要求确认。
+向导会依次询问协议、`base_url`、API Key、模型、官方对照模型、上下文长度、推理深度和扣费币种。API Key 使用隐藏输入，不会写入命令历史。选择扣费币种后，向导会查询带日期的 USD 市场参考汇率并允许覆盖；发送真实请求前还会展示预估输入成本并要求确认。
 
 脚本或非交互环境使用 `probe`，并显式传入 `--yes`：
 
@@ -102,12 +102,16 @@ OpenAI 默认使用 `Authorization: Bearer`；Anthropic 默认使用 `x-api-key`
 OpenAI 推理示例：
 
 ```bash
+--reasoning none
+--reasoning minimal
 --reasoning low
 --reasoning medium
 --reasoning high
+--reasoning xhigh
+--reasoning max
 ```
 
-工具会原样发送 `reasoning.effort`；不是每个模型都支持每个档位，服务端拒绝时不会静默降级。
+交互向导会列出 `none/minimal/low/medium/high/xhigh/max`，也允许输入未来新增的自定义值。工具会原样发送 `reasoning.effort`；不是每个模型都支持每个档位，服务端拒绝时不会静默降级。
 
 Anthropic 新模型默认发送 adaptive thinking：
 
@@ -117,6 +121,8 @@ Anthropic 新模型默认发送 adaptive thinking：
   "output_config": { "effort": "high" }
 }
 ```
+
+交互向导为 adaptive thinking 提供关闭、`low`、`medium`、`high`、`max` 和自定义值。具体支持范围同样由所选模型决定。
 
 旧模型可改用：
 
@@ -201,6 +207,8 @@ rate-lens analyze response.json --official-model gpt-5.4
 ```
 
 使用站内额度时可把 `--actual-currency` 写成 `QUOTA`，并把每 USD 对应的额度作为汇率。
+
+交互模式会先选择 `USD/CNY/HKD/TWD/EUR/JPY/GBP/SGD`、自定义 ISO 4217 币种或站内额度，再填写 `1 USD` 对应的扣费币种数量。货币汇率参考来自 [Frankfurter](https://frankfurter.dev/) 的最近可用报价，界面会显示报价日期；它只是市场参考值，中转站结算汇率可能不同，最终值可以手工覆盖。查询失败时向导会自动退回手工输入。
 
 要得到可信倍率，建议确保余额差对应且只对应本次请求；排除并发请求、返利、免费额度、失败退款、固定手续费和服务端工具调用。结果是“观测有效倍率”，不一定等于中转站后台某一个单独配置值。
 
