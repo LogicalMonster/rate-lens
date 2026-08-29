@@ -147,12 +147,21 @@ rate-lens catalog --protocol openai --json
 
 - [OpenAI API Pricing](https://developers.openai.com/api/docs/pricing)
 - [Anthropic API Pricing](https://platform.claude.com/docs/en/about-claude/pricing)
+- [Anthropic Context Windows](https://platform.claude.com/docs/en/build-with-claude/context-windows)
+- [Anthropic Service Tiers](https://platform.claude.com/docs/en/api/service-tiers)
 
 默认 `--price-tier auto`。对已知阈值的模型会自动选择长上下文价格；如果官方列出长/短两档但目录无法确认阈值，工具会按 standard 计算并警告，可显式指定：
 
 ```bash
 --price-tier long
 ```
+
+当前已核对的规则如下：
+
+- GPT-5.4、GPT-5.5 和 GPT-5.6 Sol/Terra/Luna 的长上下文高价档都按单次请求的输入 token 判断：`input_tokens > 272_000` 时，整次请求使用长上下文价格；恰好 272,000 仍按 standard。GPT-5.6 的长档相当于输入、缓存读取和缓存写入 2×，输出 1.5×。
+- Anthropic 当前文档明确：Claude 4.6 及以后支持 1M 上下文的模型，全窗口使用标准价，无长上下文溢价；Claude Sonnet 4.5、Sonnet 4 等其余模型只有 200K 上下文，不能把超过 200K 当作可计费的长档请求。
+- Anthropic `inference_geo: "us"` 对 Claude 4.6 及以后所有 token 类别使用 1.1×；Fast mode 目前仅 Opus 5/4.8，输入/输出为 10/50 USD/MTok；Batch 输入和输出为标准价 50%，缓存倍率与地域倍率可叠加。
+- Anthropic Priority Tier 是既有容量承诺，不是另一套公开的按 token 单价；`service_tier: "auto"` 可能使用 Priority 容量，也可能回退 Standard。
 
 Fast mode、regional/inference geo、Batch 或 Priority 等非标准价格不会被自动猜测。可用 `--input-rate`、`--output-rate` 和缓存价格参数手工覆盖；手工定价时输入、输出价格必须成对提供。
 

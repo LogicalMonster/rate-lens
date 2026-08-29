@@ -105,7 +105,7 @@ const ENTRIES: &[Entry] = &[
         aliases: &["gpt-5.6-sol"],
         standard: openai("4", "0.4", Some("5"), "20"),
         long: Some(openai("8", "0.8", Some("10"), "30")),
-        long_threshold: None,
+        long_threshold: Some(272_000),
     },
     Entry {
         protocol: Protocol::OpenAiResponses,
@@ -114,7 +114,7 @@ const ENTRIES: &[Entry] = &[
         aliases: &["gpt-5.6-terra"],
         standard: openai("2", "0.2", Some("2.5"), "12"),
         long: Some(openai("4", "0.4", Some("5"), "18")),
-        long_threshold: None,
+        long_threshold: Some(272_000),
     },
     Entry {
         protocol: Protocol::OpenAiResponses,
@@ -123,7 +123,7 @@ const ENTRIES: &[Entry] = &[
         aliases: &["gpt-5.6-luna"],
         standard: openai("0.2", "0.02", Some("0.25"), "1.2"),
         long: Some(openai("0.4", "0.04", Some("0.5"), "1.8")),
-        long_threshold: None,
+        long_threshold: Some(272_000),
     },
     Entry {
         protocol: Protocol::OpenAiResponses,
@@ -374,8 +374,8 @@ const ENTRIES: &[Entry] = &[
         display_name: "Claude Sonnet 4.5",
         aliases: &["claude-sonnet-4.5", "claude-sonnet-4-5", "sonnet-4.5"],
         standard: anthropic("3", "0.3", "3.75", "6", "15"),
-        long: Some(anthropic("6", "0.6", "7.5", "12", "22.5")),
-        long_threshold: Some(200_000),
+        long: None,
+        long_threshold: None,
     },
     Entry {
         protocol: Protocol::AnthropicMessages,
@@ -383,8 +383,8 @@ const ENTRIES: &[Entry] = &[
         display_name: "Claude Sonnet 4",
         aliases: &["claude-sonnet-4", "sonnet-4"],
         standard: anthropic("3", "0.3", "3.75", "6", "15"),
-        long: Some(anthropic("6", "0.6", "7.5", "12", "22.5")),
-        long_threshold: Some(200_000),
+        long: None,
+        long_threshold: None,
     },
     Entry {
         protocol: Protocol::AnthropicMessages,
@@ -491,7 +491,9 @@ pub fn resolve_pricing(
             "long",
         ),
         PriceTier::Auto => match (entry.long, entry.long_threshold) {
-            (Some(long), Some(threshold)) if input_tokens >= threshold => (long, "long"),
+            // Official wording is "above"/"exceeding" the threshold, so a request
+            // exactly on the boundary remains in the standard tier.
+            (Some(long), Some(threshold)) if input_tokens > threshold => (long, "long"),
             (Some(_), None) => {
                 warnings.push(format!(
                     "{} 的官方价格页列出了短/长上下文两档，但目录未确认切换阈值；本次按 standard 档计算。长上下文请求请显式使用 --price-tier long。",
@@ -609,15 +611,49 @@ mod tests {
     }
 
     #[test]
-    fn selects_known_long_context_tier() {
-        let result = resolve_pricing(
-            Protocol::OpenAiResponses,
-            "gpt-5.4",
-            300_000,
-            PriceTier::Auto,
-        )
-        .unwrap();
-        assert_eq!(result.tier, "long");
-        assert_eq!(result.pricing.uncached_input_per_million, decimal("5"));
+    fn long_context_tier_starts_above_the_threshold() {
+        for (model, standard_rate, long_rate) in [
+            ("gpt-5.6-sol", "4", "8"),
+            ("gpt-5.6-terra", "2", "4"),
+            ("gpt-5.6-luna", "0.2", "0.4"),
+            ("gpt-5.5", "5", "10"),
+            ("gpt-5.4", "2.5", "5"),
+        ] {
+            for (input_tokens, expected_tier, expected_input_rate) in [
+                (271_999, "standard", standard_rate),
+                (272_000, "standard", standard_rate),
+                (272_001, "long", long_rate),
+            ] {
+                let result = resolve_pricing(
+                    Protocol::OpenAiResponses,
+                    model,
+                    input_tokens,
+                    PriceTier::Auto,
+                )
+                .unwrap();
+                assert_eq!(result.tier, expected_tier, "model={model}");
+                assert_eq!(
+                    result.pricing.uncached_input_per_million,
+                    decimal(expected_input_rate),
+                    "model={model}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_anthropic_models_do_not_expose_a_long_price_tier() {
+        for model in ["claude-sonnet-4.5", "claude-sonnet-4"] {
+            let auto =
+                resolve_pricing(Protocol::AnthropicMessages, model, 200_001, PriceTier::Auto)
+                    .unwrap();
+            assert_eq!(auto.tier, "standard");
+            assert_eq!(auto.pricing.uncached_input_per_million, decimal("3"));
+
+            let error =
+                resolve_pricing(Protocol::AnthropicMessages, model, 200_001, PriceTier::Long)
+                    .unwrap_err();
+            assert!(matches!(error, CatalogError::NoLongTier { .. }));
+        }
     }
 }
