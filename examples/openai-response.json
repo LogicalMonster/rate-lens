@@ -1,0 +1,18 @@
+{
+  "id": "resp_example",
+  "object": "response",
+  "model": "example-openai-model",
+  "service_tier": "default",
+  "usage": {
+    "input_tokens": 1000000,
+    "input_tokens_details": {
+      "cached_tokens": 200000,
+      "cache_write_tokens": 0
+    },
+    "output_tokens": 100000,
+    "output_tokens_details": {
+      "reasoning_tokens": 60000
+    },
+    "total_tokens": 1100000
+  }
+}

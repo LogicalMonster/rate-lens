@@ -1,0 +1,23 @@
+{
+  "id": "msg_example",
+  "type": "message",
+  "model": "example-anthropic-model",
+  "usage": {
+    "input_tokens": 800000,
+    "cache_creation_input_tokens": 200000,
+    "cache_read_input_tokens": 400000,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 150000,
+      "ephemeral_1h_input_tokens": 50000
+    },
+    "output_tokens": 100000,
+    "output_tokens_details": {
+      "thinking_tokens": 40000
+    },
+    "server_tool_use": {
+      "web_fetch_requests": 0,
+      "web_search_requests": 0
+    },
+    "service_tier": "standard"
+  }
+}
