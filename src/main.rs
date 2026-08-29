@@ -1,9 +1,9 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rate_lens::{
-    Analysis, AnthropicThinkingMode, AuthStyle, CATALOG_AS_OF, ParseReport, PriceTier, Pricing,
-    ProbeConfig, Protocol, ProtocolHint, ResolvedPricing, TokenCost, analyze_usage, catalog_models,
-    fetch_usd_exchange_rate, list_models, normalize_currency, parse_usage, resolve_pricing,
-    run_probe,
+    Analysis, AnthropicThinkingMode, AuthStyle, CatalogLoadOptions, CatalogSourceKind, ParseReport,
+    PriceTier, Pricing, PricingCatalog, PricingSourceMode, ProbeConfig, Protocol, ProtocolHint,
+    ResolvedPricing, TokenCost, analyze_usage, fetch_usd_exchange_rate, list_models,
+    load_pricing_catalog, normalize_currency, parse_usage, run_probe,
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -23,6 +23,18 @@ use std::str::FromStr;
     long_about = "直接调用 OpenAI Responses 或 Anthropic Messages 兼容端点，\n按真实 usage 计算官方理论成本；提供中转扣费后再计算观测倍率。"
 )]
 struct Cli {
+    /// 官方价格来源：auto 实时刷新并回退缓存/内置快照，live 禁止回退，builtin 完全离线
+    #[arg(long, value_enum, global = true, default_value_t = PricingSourceArg::Auto)]
+    pricing_source: PricingSourceArg,
+
+    /// 获取官方价格页面的 HTTP 超时（秒）
+    #[arg(long, global = true, default_value_t = 20)]
+    pricing_timeout: u64,
+
+    /// 官方价格缓存目录；也可设置 RATE_LENS_CACHE_DIR
+    #[arg(long, global = true)]
+    pricing_cache_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -35,7 +47,7 @@ enum Command {
     Analyze(AnalyzeArgs),
     /// 从中转站的 /v1/models 获取可用模型
     Models(ModelsArgs),
-    /// 列出内置的官方价格目录
+    /// 列出当前官方价格目录
     Catalog(CatalogArgs),
 }
 
@@ -270,6 +282,14 @@ enum PriceTierArg {
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum PricingSourceArg {
+    #[default]
+    Auto,
+    Live,
+    Builtin,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
 enum ThinkingModeArg {
     #[default]
     Adaptive,
@@ -282,7 +302,11 @@ struct PricingMetadata {
     display_name: String,
     tier: String,
     source: String,
+    source_kind: CatalogSourceKind,
     as_of: String,
+    fetched_at: Option<String>,
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -318,17 +342,26 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let catalog_options = CatalogLoadOptions {
+        source: cli.pricing_source.into(),
+        timeout_seconds: cli.pricing_timeout,
+        cache_dir: cli.pricing_cache_dir,
+    };
     match cli.command {
-        Some(Command::Probe(args)) => run_probe_command(args),
-        Some(Command::Analyze(args)) => run_analyze(args),
+        Some(Command::Probe(args)) => run_probe_command(args, &catalog_options),
+        Some(Command::Analyze(args)) => run_analyze(args, &catalog_options),
         Some(Command::Models(args)) => run_models(args),
-        Some(Command::Catalog(args)) => run_catalog(args),
-        None => run_wizard(),
+        Some(Command::Catalog(args)) => run_catalog(args, &catalog_options),
+        None => run_wizard(&catalog_options),
     }
 }
 
-fn run_probe_command(args: ProbeArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_probe_command(
+    args: ProbeArgs,
+    catalog_options: &CatalogLoadOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Protocol::from(args.protocol);
+    let catalog = load_pricing_catalog(protocol, catalog_options)?;
     let api_key = resolve_api_key(args.api_key.clone(), &args.api_key_env)?;
     let auth_style = args
         .auth_style
@@ -345,7 +378,7 @@ fn run_probe_command(args: ProbeArgs) -> Result<(), Box<dyn std::error::Error>> 
         extra: args.accounting.extra_official_cost,
     };
     let (estimated_pricing, _, _) = resolve_requested_pricing(
-        protocol,
+        &catalog,
         pricing_model,
         args.context_tokens,
         args.price_tier.into(),
@@ -373,7 +406,7 @@ fn run_probe_command(args: ProbeArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let (pricing, pricing_metadata, mut warnings) = resolve_requested_pricing(
-        protocol,
+        &catalog,
         pricing_model,
         result.report.usage.total_input_tokens(),
         args.price_tier.into(),
@@ -425,7 +458,10 @@ fn run_probe_command(args: ProbeArgs) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn run_analyze(args: AnalyzeArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_analyze(
+    args: AnalyzeArgs,
+    catalog_options: &CatalogLoadOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input = read_input(&args.input)?;
     let ParseReport {
         usage,
@@ -434,6 +470,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<(), Box<dyn std::error::Error>> {
     append_usage_warnings(&usage, &mut warnings);
 
     let protocol = usage.protocol;
+    let catalog = load_pricing_catalog(protocol, catalog_options)?;
     let inferred_model = (usage.models.len() == 1)
         .then(|| usage.models.iter().next().cloned())
         .flatten();
@@ -443,7 +480,7 @@ fn run_analyze(args: AnalyzeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .or(inferred_model.as_deref())
         .unwrap_or("");
     let (pricing, pricing_metadata, catalog_warnings) = resolve_requested_pricing(
-        protocol,
+        &catalog,
         catalog_model,
         usage.total_input_tokens(),
         args.price_tier.into(),
@@ -516,14 +553,21 @@ fn run_models(args: ModelsArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_catalog(args: CatalogArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_catalog(
+    args: CatalogArgs,
+    catalog_options: &CatalogLoadOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     let protocols = match args.protocol {
         Some(protocol) => vec![Protocol::from(protocol)],
         None => vec![Protocol::OpenAiResponses, Protocol::AnthropicMessages],
     };
-    let entries = protocols
+    let catalogs = protocols
         .into_iter()
-        .flat_map(catalog_models)
+        .map(|protocol| load_pricing_catalog(protocol, catalog_options))
+        .collect::<Result<Vec<_>, _>>()?;
+    let entries = catalogs
+        .iter()
+        .flat_map(PricingCatalog::models)
         .collect::<Vec<_>>();
     if args.json {
         let values = entries
@@ -533,13 +577,37 @@ fn run_catalog(args: CatalogArgs) -> Result<(), Box<dyn std::error::Error>> {
                     "protocol": entry.protocol,
                     "id": entry.id,
                     "display_name": entry.display_name,
-                    "as_of": CATALOG_AS_OF,
+                    "source_kind": entry.source_kind,
+                    "source": entry.source,
+                    "as_of": entry.as_of,
+                    "fetched_at": entry.fetched_at,
                 })
             })
             .collect::<Vec<_>>();
         println!("{}", serde_json::to_string_pretty(&values)?);
+        for catalog in &catalogs {
+            for warning in catalog.warnings() {
+                eprintln!("注意：{warning}");
+            }
+        }
     } else {
-        println!("内置官方价格目录（截至 {CATALOG_AS_OF}）");
+        println!("官方价格目录");
+        for catalog in &catalogs {
+            for source in catalog.source_summaries() {
+                let fetched = source
+                    .fetched_at
+                    .as_deref()
+                    .map(|value| format!("，获取于 {value}"))
+                    .unwrap_or_default();
+                println!(
+                    "来源：{}（{}；截至 {}{}）",
+                    source.source,
+                    source.kind.as_str(),
+                    source.as_of,
+                    fetched
+                );
+            }
+        }
         let mut last_protocol = None;
         for entry in entries {
             if last_protocol != Some(entry.protocol) {
@@ -549,11 +617,17 @@ fn run_catalog(args: CatalogArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("  {:<24} {}", entry.id, entry.display_name);
         }
+        println!();
+        for catalog in &catalogs {
+            for warning in catalog.warnings() {
+                println!("注意：{warning}");
+            }
+        }
     }
     Ok(())
 }
 
-fn run_wizard() -> Result<(), Box<dyn std::error::Error>> {
+fn run_wizard(catalog_options: &CatalogLoadOptions) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return Err("无参数交互向导需要终端；脚本中请使用 `rate-lens probe --help`".into());
     }
@@ -564,6 +638,8 @@ fn run_wizard() -> Result<(), Box<dyn std::error::Error>> {
         "2" => Protocol::AnthropicMessages,
         _ => Protocol::OpenAiResponses,
     };
+    eprintln!("正在刷新官方价格目录……");
+    let catalog = load_pricing_catalog(protocol, catalog_options)?;
     let default_url = match protocol {
         Protocol::OpenAiResponses => "https://api.openai.com/v1",
         Protocol::AnthropicMessages => "https://api.anthropic.com/v1",
@@ -602,14 +678,14 @@ fn run_wizard() -> Result<(), Box<dyn std::error::Error>> {
     let exchange_rate = prompt_exchange_rate(&actual_currency)?;
 
     let (estimated_pricing, _, _) = resolve_requested_pricing(
-        protocol,
+        &catalog,
         &official_model,
         context_tokens,
         PriceTier::Auto,
         ManualRates::empty(),
     )?;
     let estimated_pricing =
-        estimated_pricing.ok_or("内置目录无法匹配官方模型；请改用 probe 命令并手工传入价格")?;
+        estimated_pricing.ok_or("官方价格目录无法匹配模型；请改用 probe 命令并手工传入价格")?;
     eprintln!(
         "\n预计输入成本约 {} USD（最终按响应 usage 计算）。",
         money(rate_lens::approximate_official_input_cost(
@@ -638,7 +714,7 @@ fn run_wizard() -> Result<(), Box<dyn std::error::Error>> {
     let charged_text = prompt("本次中转实际扣费（可留空，只查看官方价）", "")?;
     let charged = parse_optional_decimal(&charged_text)?;
     let (pricing, metadata, mut all_warnings) = resolve_requested_pricing(
-        protocol,
+        &catalog,
         &official_model,
         result.report.usage.total_input_tokens(),
         PriceTier::Auto,
@@ -725,14 +801,14 @@ impl ManualRates {
 type PricingResolution = (Option<Pricing>, Option<PricingMetadata>, Vec<String>);
 
 fn resolve_requested_pricing(
-    protocol: Protocol,
+    catalog: &PricingCatalog,
     model: &str,
     input_tokens: u64,
     tier: PriceTier,
     manual: ManualRates,
 ) -> Result<PricingResolution, Box<dyn std::error::Error>> {
-    let catalog = resolve_pricing(protocol, model, input_tokens, tier);
-    match catalog {
+    let resolved = catalog.resolve(model, input_tokens, tier);
+    match resolved {
         Ok(resolved) if manual.input.is_some() == manual.output.is_some() => {
             let metadata = pricing_metadata(&resolved);
             Ok((
@@ -747,7 +823,7 @@ fn resolve_requested_pricing(
         }
         Err(error) if manual.build().is_some() => {
             let mut warnings = vec![format!(
-                "未使用内置价格目录（{error}）；本次按手工价格计算。"
+                "未使用官方价格目录（{error}）；本次按手工价格计算。"
             )];
             if !model.trim().is_empty() {
                 warnings.push("请自行确认手工价格与官方对照模型、价格档一致。".to_owned());
@@ -871,7 +947,7 @@ fn print_human(
     );
     if let Some(metadata) = pricing_metadata {
         println!(
-            "官方对照模型  {}（{} 档；目录截至 {}）",
+            "官方对照模型  {}（{} 档；价格截至 {}）",
             metadata.display_name, metadata.tier, metadata.as_of
         );
     } else {
@@ -961,7 +1037,14 @@ fn print_human(
 
     if let Some(metadata) = pricing_metadata {
         println!();
-        println!("价格来源      {}", metadata.source);
+        println!(
+            "价格来源      {}（{}）",
+            metadata.source,
+            metadata.source_kind.as_str()
+        );
+        if let Some(fetched_at) = metadata.fetched_at.as_deref() {
+            println!("获取时间      {fetched_at}");
+        }
     }
     if !warnings.is_empty() {
         println!();
@@ -978,7 +1061,11 @@ fn pricing_metadata(resolved: &ResolvedPricing) -> PricingMetadata {
         display_name: resolved.display_name.to_owned(),
         tier: resolved.tier.to_owned(),
         source: resolved.source.to_owned(),
+        source_kind: resolved.source_kind,
         as_of: resolved.as_of.to_owned(),
+        fetched_at: resolved.fetched_at.clone(),
+        etag: resolved.etag.clone(),
+        last_modified: resolved.last_modified.clone(),
     }
 }
 
@@ -1253,6 +1340,16 @@ impl From<PriceTierArg> for PriceTier {
             PriceTierArg::Auto => Self::Auto,
             PriceTierArg::Standard => Self::Standard,
             PriceTierArg::Long => Self::Long,
+        }
+    }
+}
+
+impl From<PricingSourceArg> for PricingSourceMode {
+    fn from(value: PricingSourceArg) -> Self {
+        match value {
+            PricingSourceArg::Auto => Self::Auto,
+            PricingSourceArg::Live => Self::Live,
+            PricingSourceArg::Builtin => Self::Builtin,
         }
     }
 }

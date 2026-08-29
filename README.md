@@ -13,7 +13,7 @@
 - 从 `GET /v1/models` 发现中转站模型
 - 用官方兼容的 token-count 端点校准目标上下文
 - 选择推理深度或 Anthropic thinking 模式
-- 内置官方模型价格，也允许手工覆盖价格
+- 启动时自动获取官方模型价格，支持缓存、内置回退和手工覆盖
 - 保留 JSON、JSONL 和 SSE 的离线分析能力
 
 ## 最快使用方式
@@ -134,21 +134,50 @@ Anthropic 新模型默认发送 adaptive thinking：
 
 `enabled` 模式要求 thinking budget 至少为 1024，而且 `max-output-tokens` 必须大于 budget。
 
-## 官方价格和长上下文档
+## 官方价格自动更新和长上下文档
 
-查看内置目录：
+默认价格来源模式是 `auto`。每次运行需要计价的命令时，工具会读取官方 Markdown 价格页；成功后把解析并校验过的目录写入本地缓存。OpenAI 支持 `ETag`/`Last-Modified` 条件请求，页面未变化时直接复用缓存；Anthropic 没有稳定的条件缓存头时会重新下载。
+
+如果官方页面暂时不可访问或解析失败，`auto` 会依次回退到上次成功缓存和编译时内置快照，并在输出中明确标出 `live`、`cache` 或 `builtin` 及回退原因。一次程序运行只加载一次所选协议的目录，不会在预估和最终结算阶段重复联网。
+
+查看当前目录：
 
 ```bash
 rate-lens catalog
 rate-lens catalog --protocol openai --json
 ```
 
-目录中的每条计算结果都会显示价格来源和快照日期。价格会变化，重要结论应再次查阅：
+可显式选择来源模式：
 
-- [OpenAI API Pricing](https://developers.openai.com/api/docs/pricing)
-- [Anthropic API Pricing](https://platform.claude.com/docs/en/about-claude/pricing)
+```bash
+# 默认：尝试实时刷新，失败时安全回退
+rate-lens --pricing-source auto catalog
+
+# 必须使用本次实时获取结果；网络或解析失败即报错
+rate-lens --pricing-source live catalog --protocol openai
+
+# 完全离线，只使用编译时快照
+rate-lens --pricing-source builtin analyze response.json --official-model gpt-5.4
+```
+
+获取超时可用 `--pricing-timeout 30` 调整；缓存目录可用 `--pricing-cache-dir PATH` 或 `RATE_LENS_CACHE_DIR` 指定。默认缓存位置遵循平台约定：macOS 为 `~/Library/Caches/rate-lens`，Linux 为 `$XDG_CACHE_HOME/rate-lens`（未设置时 `~/.cache/rate-lens`），Windows 为 `%LOCALAPPDATA%\\rate-lens`。
+
+联网请求遵循 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和对应小写变量。例如：
+
+```bash
+export http_proxy=http://127.0.0.1:10808
+export https_proxy=http://127.0.0.1:10808
+rate-lens --pricing-source live catalog
+```
+
+两家都没有公开稳定的定价 JSON API，因此自动更新解析的是以下官方 Markdown 文档，而 `/v1/models` 不参与价格获取：
+
+- [OpenAI API Pricing Markdown](https://developers.openai.com/api/docs/pricing.md)
+- [Anthropic API Pricing Markdown](https://platform.claude.com/docs/en/about-claude/pricing.md)
 - [Anthropic Context Windows](https://platform.claude.com/docs/en/build-with-claude/context-windows)
 - [Anthropic Service Tiers](https://platform.claude.com/docs/en/api/service-tiers)
+
+远程结果只有在来源地址、Content-Type、模型数量、模型唯一性和所有价格字段通过严格校验后才会替换缓存。OpenAI 价格表列出长上下文价格但没有给出阈值时，工具还会读取该模型的官方 Markdown 页面提取阈值；模型页不可用时才保留已核对的内置阈值。未知新模型仍无法确认阈值时会要求显式选择 `--price-tier long` 并给出警告，避免自行猜测。
 
 默认 `--price-tier auto`。对已知阈值的模型会自动选择长上下文价格；如果官方列出长/短两档但目录无法确认阈值，工具会按 standard 计算并警告，可显式指定：
 
