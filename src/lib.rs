@@ -6,9 +6,9 @@ mod probe;
 
 pub use catalog::{
     ANTHROPIC_PRICING_SOURCE, CATALOG_AS_OF, CatalogError, CatalogLoadError, CatalogLoadOptions,
-    CatalogModel, CatalogSourceKind, CatalogSourceSummary, OPENAI_PRICING_SOURCE, PriceTier,
-    PricingCatalog, PricingSourceMode, ResolvedPricing, catalog_models, load_pricing_catalog,
-    resolve_pricing,
+    CatalogModel, CatalogPricingProfile, CatalogSourceKind, CatalogSourceSummary,
+    OPENAI_PRICING_SOURCE, PriceTier, PricingCatalog, PricingSourceMode, ResolvedPricing,
+    catalog_models, load_pricing_catalog, resolve_pricing,
 };
 pub use exchange::{
     EXCHANGE_RATE_SOURCE, ExchangeRateError, ExchangeRateQuote, fetch_usd_exchange_rate,

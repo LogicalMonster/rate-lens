@@ -35,6 +35,20 @@ pub struct ProbeConfig {
     pub max_output_tokens: u64,
     pub anthropic_thinking_mode: AnthropicThinkingMode,
     pub thinking_budget_tokens: u64,
+    /// Enables prompt-cache controls for a cache test. Callers should set this
+    /// only after confirming that the relay accepts the relevant fields.
+    pub enable_prompt_cache: bool,
+    /// A stable key shared by the two requests in an interactive cache test.
+    pub prompt_cache_key: Option<String>,
+    /// Optional run-unique marker near the beginning of the generated prompt.
+    pub prompt_marker: Option<String>,
+    /// Optional explicit cache-isolation mode. This is deliberately opt-in;
+    /// ordinary wizard probes leave it disabled for relay compatibility.
+    pub disable_implicit_prompt_cache: bool,
+    /// Whether the relay has explicitly been confirmed to accept cache
+    /// controls. For Anthropic this gates `cache_control` as well. The field
+    /// name is retained for compatibility with existing callers.
+    pub openai_prompt_cache_options: bool,
     pub timeout_seconds: u64,
 }
 
@@ -78,6 +92,8 @@ pub enum ProbeError {
         "Anthropic enabled thinking 要求 thinking budget 至少为 1024，且 max output tokens 必须大于 thinking budget"
     )]
     InvalidThinkingBudget,
+    #[error("启用缓存控制前必须明确确认中转站支持对应参数")]
+    PromptCacheSupportNotConfirmed,
     #[error("无法构建 HTTP 客户端：{0}")]
     Client(String),
     #[error("请求 {endpoint} 失败：{source}")]
@@ -243,6 +259,11 @@ fn validate_config(config: &ProbeConfig) -> Result<(), ProbeError> {
     }
     if config.max_output_tokens == 0 {
         return Err(ProbeError::InvalidMaxOutputTokens);
+    }
+    if (config.enable_prompt_cache || config.disable_implicit_prompt_cache)
+        && !config.openai_prompt_cache_options
+    {
+        return Err(ProbeError::PromptCacheSupportNotConfirmed);
     }
     if config.protocol == Protocol::AnthropicMessages
         && config.reasoning_effort.is_some()
@@ -410,6 +431,8 @@ fn count_tokens(
                 object.remove("max_output_tokens");
                 object.remove("reasoning");
                 object.remove("store");
+                object.remove("prompt_cache_options");
+                object.remove("prompt_cache_key");
             }
             value
         }
@@ -419,6 +442,7 @@ fn count_tokens(
                 object.remove("max_tokens");
                 object.remove("thinking");
                 object.remove("output_config");
+                object.remove("cache_control");
             }
             value
         }
@@ -439,7 +463,7 @@ fn count_tokens(
 }
 
 fn build_payload(config: &ProbeConfig, filler_units: u64) -> Value {
-    let prompt = build_prompt(filler_units);
+    let prompt = build_prompt(filler_units, config.prompt_marker.as_deref());
     match config.protocol {
         Protocol::OpenAiResponses => {
             let mut payload = json!({
@@ -453,6 +477,14 @@ fn build_payload(config: &ProbeConfig, filler_units: u64) -> Value {
             });
             if let Some(effort) = config.reasoning_effort.as_deref() {
                 payload["reasoning"] = json!({"effort": effort});
+            }
+            if config.enable_prompt_cache && config.openai_prompt_cache_options {
+                payload["prompt_cache_options"] = json!({"mode": "implicit", "ttl": "30m"});
+                if let Some(key) = config.prompt_cache_key.as_deref() {
+                    payload["prompt_cache_key"] = json!(key);
+                }
+            } else if config.disable_implicit_prompt_cache && config.openai_prompt_cache_options {
+                payload["prompt_cache_options"] = json!({"mode": "explicit"});
             }
             payload
         }
@@ -476,12 +508,15 @@ fn build_payload(config: &ProbeConfig, filler_units: u64) -> Value {
                     }
                 }
             }
+            if config.enable_prompt_cache && config.openai_prompt_cache_options {
+                payload["cache_control"] = json!({"type": "ephemeral"});
+            }
             payload
         }
     }
 }
 
-fn build_prompt(filler_units: u64) -> String {
+fn build_prompt(filler_units: u64, marker: Option<&str>) -> String {
     const PREFIX: &str = "这是 API 计量测试。忽略下方重复内容，只回复 OK，不要解释。\n";
     const UNIT: &str = " context";
     let capacity = PREFIX.len().saturating_add(
@@ -491,6 +526,11 @@ fn build_prompt(filler_units: u64) -> String {
     );
     let mut prompt = String::with_capacity(capacity);
     prompt.push_str(PREFIX);
+    if let Some(marker) = marker {
+        prompt.push_str("测试批次：");
+        prompt.push_str(marker);
+        prompt.push('\n');
+    }
     for _ in 0..filler_units {
         prompt.push_str(UNIT);
     }
@@ -565,9 +605,10 @@ mod tests {
 
     #[test]
     fn prompt_has_the_requested_number_of_filler_units() {
-        let prompt = build_prompt(123);
+        let prompt = build_prompt(123, Some("run-1"));
         assert_eq!(prompt.matches(" context").count(), 123);
         assert!(prompt.starts_with("这是 API 计量测试"));
+        assert!(prompt.contains("测试批次：run-1"));
     }
 
     #[test]
@@ -606,6 +647,11 @@ mod tests {
             max_output_tokens: 16,
             anthropic_thinking_mode: AnthropicThinkingMode::Adaptive,
             thinking_budget_tokens: 1_024,
+            enable_prompt_cache: false,
+            prompt_cache_key: None,
+            prompt_marker: None,
+            disable_implicit_prompt_cache: false,
+            openai_prompt_cache_options: false,
             timeout_seconds: 5,
         })
         .unwrap();
@@ -659,6 +705,11 @@ mod tests {
             max_output_tokens: 64,
             anthropic_thinking_mode: AnthropicThinkingMode::Adaptive,
             thinking_budget_tokens: 1_024,
+            enable_prompt_cache: false,
+            prompt_cache_key: None,
+            prompt_marker: None,
+            disable_implicit_prompt_cache: false,
+            openai_prompt_cache_options: false,
             timeout_seconds: 5,
         })
         .unwrap();
@@ -673,6 +724,138 @@ mod tests {
         let body = request_json_body(&requests[1]);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn cache_mode_adds_protocol_specific_cache_controls() {
+        let openai = build_payload(
+            &ProbeConfig {
+                protocol: Protocol::OpenAiResponses,
+                base_url: "https://example.test".to_owned(),
+                api_key: "secret".to_owned(),
+                auth_style: AuthStyle::Bearer,
+                model: "gpt-5.6-sol".to_owned(),
+                context_tokens: 8_000,
+                reasoning_effort: None,
+                max_output_tokens: 16,
+                anthropic_thinking_mode: AnthropicThinkingMode::Adaptive,
+                thinking_budget_tokens: 1_024,
+                enable_prompt_cache: true,
+                prompt_cache_key: Some("rate-lens-test".to_owned()),
+                prompt_marker: Some("run-1".to_owned()),
+                disable_implicit_prompt_cache: false,
+                openai_prompt_cache_options: true,
+                timeout_seconds: 5,
+            },
+            8_000,
+        );
+        assert_eq!(openai["prompt_cache_options"]["mode"], "implicit");
+        assert_eq!(openai["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(openai["prompt_cache_key"], "rate-lens-test");
+
+        let anthropic = build_payload(
+            &ProbeConfig {
+                protocol: Protocol::AnthropicMessages,
+                base_url: "https://example.test".to_owned(),
+                api_key: "secret".to_owned(),
+                auth_style: AuthStyle::XApiKey,
+                model: "claude-sonnet-4-6".to_owned(),
+                context_tokens: 8_000,
+                reasoning_effort: None,
+                max_output_tokens: 16,
+                anthropic_thinking_mode: AnthropicThinkingMode::Adaptive,
+                thinking_budget_tokens: 1_024,
+                enable_prompt_cache: true,
+                prompt_cache_key: None,
+                prompt_marker: Some("run-1".to_owned()),
+                disable_implicit_prompt_cache: false,
+                openai_prompt_cache_options: true,
+                timeout_seconds: 5,
+            },
+            8_000,
+        );
+        assert_eq!(anthropic["cache_control"]["type"], "ephemeral");
+        assert!(anthropic["cache_control"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn ordinary_payload_never_adds_cache_controls_without_cache_opt_in() {
+        let payload = build_payload(
+            &ProbeConfig {
+                protocol: Protocol::OpenAiResponses,
+                base_url: "https://example.test".to_owned(),
+                api_key: "secret".to_owned(),
+                auth_style: AuthStyle::Bearer,
+                model: "gpt-5.6-sol".to_owned(),
+                context_tokens: 8_000,
+                reasoning_effort: None,
+                max_output_tokens: 16,
+                anthropic_thinking_mode: AnthropicThinkingMode::Adaptive,
+                thinking_budget_tokens: 1_024,
+                enable_prompt_cache: false,
+                prompt_cache_key: None,
+                prompt_marker: Some("run-1".to_owned()),
+                disable_implicit_prompt_cache: false,
+                openai_prompt_cache_options: true,
+                timeout_seconds: 5,
+            },
+            8_000,
+        );
+        assert!(payload.get("prompt_cache_options").is_none());
+        assert!(payload.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn cache_controls_are_omitted_without_relay_confirmation() {
+        let payload = build_payload(
+            &ProbeConfig {
+                protocol: Protocol::OpenAiResponses,
+                base_url: "https://example.test".to_owned(),
+                api_key: "secret".to_owned(),
+                auth_style: AuthStyle::Bearer,
+                model: "gpt-5.6-sol".to_owned(),
+                context_tokens: 8_000,
+                reasoning_effort: None,
+                max_output_tokens: 16,
+                anthropic_thinking_mode: AnthropicThinkingMode::Adaptive,
+                thinking_budget_tokens: 1_024,
+                enable_prompt_cache: true,
+                prompt_cache_key: Some("rate-lens-test".to_owned()),
+                prompt_marker: Some("run-1".to_owned()),
+                disable_implicit_prompt_cache: false,
+                openai_prompt_cache_options: false,
+                timeout_seconds: 5,
+            },
+            8_000,
+        );
+        assert!(payload.get("prompt_cache_options").is_none());
+        assert!(payload.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn cache_probe_rejects_unconfirmed_relay_before_network() {
+        let result = validate_config(&ProbeConfig {
+            protocol: Protocol::OpenAiResponses,
+            base_url: "https://example.test".to_owned(),
+            api_key: "secret".to_owned(),
+            auth_style: AuthStyle::Bearer,
+            model: "gpt-5.6-sol".to_owned(),
+            context_tokens: 8_000,
+            reasoning_effort: None,
+            max_output_tokens: 16,
+            anthropic_thinking_mode: AnthropicThinkingMode::Adaptive,
+            thinking_budget_tokens: 1_024,
+            enable_prompt_cache: true,
+            prompt_cache_key: Some("rate-lens-test".to_owned()),
+            prompt_marker: Some("run-1".to_owned()),
+            disable_implicit_prompt_cache: false,
+            openai_prompt_cache_options: false,
+            timeout_seconds: 5,
+        });
+        assert!(matches!(
+            result,
+            Err(ProbeError::PromptCacheSupportNotConfirmed)
+        ));
     }
 
     #[test]

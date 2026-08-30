@@ -102,6 +102,26 @@ pub struct CatalogModel {
     pub fetched_at: Option<String>,
 }
 
+/// Pricing information used to build safe interactive test presets.
+///
+/// Unlike [`ResolvedPricing`], this exposes both context tiers at once and
+/// keeps the provider-published switch threshold. Callers should still use
+/// [`PricingCatalog::resolve`] with the response's actual input usage for the
+/// final bill.
+#[derive(Debug, Clone)]
+pub struct CatalogPricingProfile {
+    pub official_model: String,
+    pub display_name: String,
+    pub standard: Pricing,
+    pub long: Option<Pricing>,
+    pub long_threshold: Option<u64>,
+    pub max_input_tokens: Option<u64>,
+    pub source: String,
+    pub source_kind: CatalogSourceKind,
+    pub as_of: String,
+    pub fetched_at: Option<String>,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CatalogError {
     #[error(
@@ -556,6 +576,8 @@ struct StoredEntry {
     standard: StoredRates,
     long: Option<StoredRates>,
     long_threshold: Option<u64>,
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +610,7 @@ struct OwnedEntry {
     standard: StoredRates,
     long: Option<StoredRates>,
     long_threshold: Option<u64>,
+    max_input_tokens: Option<u64>,
     metadata: CatalogMetadata,
 }
 
@@ -643,6 +666,26 @@ impl PricingCatalog {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    pub fn pricing_profile(&self, model: &str) -> Result<CatalogPricingProfile, CatalogError> {
+        let entry = self
+            .find_entry(model)
+            .ok_or_else(|| CatalogError::UnknownModel {
+                model: model.to_owned(),
+            })?;
+        Ok(CatalogPricingProfile {
+            official_model: entry.id.clone(),
+            display_name: entry.display_name.clone(),
+            standard: entry.standard.to_pricing(),
+            long: entry.long.as_ref().map(StoredRates::to_pricing),
+            long_threshold: entry.long_threshold,
+            max_input_tokens: entry.max_input_tokens,
+            source: entry.metadata.source.clone(),
+            source_kind: entry.metadata.kind,
+            as_of: entry.metadata.as_of.clone(),
+            fetched_at: entry.metadata.fetched_at.clone(),
+        })
     }
 
     pub fn resolve(
@@ -962,6 +1005,9 @@ fn merge_remote_entries(
                     ));
                 }
             }
+            if entry.max_input_tokens.is_none() {
+                entry.max_input_tokens = existing.max_input_tokens;
+            }
         }
         entry.aliases.push(entry.id.clone());
         deduplicate_aliases(&mut entry.aliases);
@@ -973,6 +1019,7 @@ fn merge_remote_entries(
             standard: entry.standard,
             long: entry.long,
             long_threshold: entry.long_threshold,
+            max_input_tokens: entry.max_input_tokens,
             metadata: metadata.clone(),
         });
     }
@@ -1004,6 +1051,7 @@ fn builtin_entries(protocol: Protocol) -> Vec<OwnedEntry> {
             standard: StoredRates::from_static(entry.standard),
             long: entry.long.map(StoredRates::from_static),
             long_threshold: entry.long_threshold,
+            max_input_tokens: builtin_max_input_tokens(entry.id),
             metadata: metadata.clone(),
         })
         .collect()
@@ -1074,6 +1122,7 @@ fn parse_openai_pricing(body: &str) -> Result<Vec<StoredEntry>, String> {
             standard,
             long,
             long_threshold: parse_context_threshold(original_model),
+            max_input_tokens: None,
         });
     }
 
@@ -1108,6 +1157,7 @@ fn parse_openai_pricing(body: &str) -> Result<Vec<StoredEntry>, String> {
                     },
                     long: None,
                     long_threshold: None,
+                    max_input_tokens: None,
                 });
             }
         }
@@ -1117,17 +1167,23 @@ fn parse_openai_pricing(body: &str) -> Result<Vec<StoredEntry>, String> {
 
 fn enrich_openai_long_thresholds(client: &Client, entries: &mut [StoredEntry]) -> Vec<String> {
     let mut warnings = Vec::new();
-    for entry in entries
-        .iter_mut()
-        .filter(|entry| entry.long.is_some() && entry.long_threshold.is_none())
-    {
+    for entry in entries.iter_mut().filter(|entry| entry.long.is_some()) {
         let url = format!("{OPENAI_MODEL_MARKDOWN_ROOT}/{}.md", entry.id);
-        match fetch_openai_model_threshold(client, &url) {
-            Ok(Some(threshold)) => entry.long_threshold = Some(threshold),
-            Ok(None) => warnings.push(format!(
-                "{} 的官方模型页未找到可确认的长上下文切换阈值；若内置快照也没有该规则，auto 将按 standard 计算。",
-                entry.id
-            )),
+        match fetch_openai_model_details(client, &url) {
+            Ok(details) => {
+                if details.long_threshold.is_some() {
+                    entry.long_threshold = details.long_threshold;
+                }
+                if details.max_input_tokens.is_some() {
+                    entry.max_input_tokens = details.max_input_tokens;
+                }
+                if entry.long_threshold.is_none() {
+                    warnings.push(format!(
+                        "{} 的官方模型页未找到可确认的长上下文切换阈值；若内置快照也没有该规则，auto 将按 standard 计算。",
+                        entry.id
+                    ));
+                }
+            }
             Err(reason) => warnings.push(format!(
                 "{} 的官方模型页阈值获取失败（{reason}）；若内置快照也没有该规则，auto 将按 standard 计算。",
                 entry.id
@@ -1137,7 +1193,13 @@ fn enrich_openai_long_thresholds(client: &Client, entries: &mut [StoredEntry]) -
     warnings
 }
 
-fn fetch_openai_model_threshold(client: &Client, url: &str) -> Result<Option<u64>, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenAiModelDetails {
+    long_threshold: Option<u64>,
+    max_input_tokens: Option<u64>,
+}
+
+fn fetch_openai_model_details(client: &Client, url: &str) -> Result<OpenAiModelDetails, String> {
     let mut response = client
         .get(url)
         .send()
@@ -1159,7 +1221,23 @@ fn fetch_openai_model_threshold(client: &Client, url: &str) -> Result<Option<u64
         ));
     }
     let body = read_limited(&mut response, MAX_MODEL_DOCUMENT_BYTES)?;
-    Ok(parse_openai_model_threshold(&body))
+    Ok(parse_openai_model_details(&body))
+}
+
+fn parse_openai_model_details(body: &str) -> OpenAiModelDetails {
+    let explicit_max_input = body
+        .lines()
+        .find_map(|line| parse_integer_near_phrase(line, "maximum input tokens"));
+    let context_window = body
+        .lines()
+        .find_map(|line| parse_integer_near_phrase(line, "context window"));
+    let max_output = body
+        .lines()
+        .find_map(|line| parse_integer_near_phrase(line, "max output tokens"));
+    OpenAiModelDetails {
+        long_threshold: parse_openai_model_threshold(body),
+        max_input_tokens: explicit_max_input.or_else(|| context_window?.checked_sub(max_output?)),
+    }
 }
 
 fn parse_openai_model_threshold(body: &str) -> Option<u64> {
@@ -1208,6 +1286,7 @@ fn parse_anthropic_pricing(body: &str) -> Result<Vec<StoredEntry>, String> {
             },
             long: None,
             long_threshold: None,
+            max_input_tokens: None,
         });
     }
     Ok(entries)
@@ -1312,6 +1391,29 @@ fn parse_k_threshold(value: &str) -> Option<u64> {
         .rev()
         .collect::<String>();
     digits.parse::<u64>().ok()?.checked_mul(1_000)
+}
+
+fn parse_first_integer(value: &str) -> Option<u64> {
+    let start = value.find(|character: char| character.is_ascii_digit())?;
+    let digits = value[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == ',')
+        .filter(|character| character.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn parse_integer_near_phrase(value: &str, phrase: &str) -> Option<u64> {
+    let phrase_start = value.to_ascii_lowercase().find(phrase)?;
+    let after = &value[phrase_start + phrase.len()..];
+    parse_first_integer(after).or_else(|| parse_last_integer(&value[..phrase_start]))
+}
+
+fn parse_last_integer(value: &str) -> Option<u64> {
+    value
+        .split(|character: char| !character.is_ascii_digit() && character != ',')
+        .filter_map(|part| part.replace(',', "").parse::<u64>().ok())
+        .next_back()
 }
 
 fn markdown_section<'a>(body: &'a str, start: &str, end: &str) -> Option<&'a str> {
@@ -1578,6 +1680,14 @@ fn normalize_model(value: &str) -> String {
     result
 }
 
+fn builtin_max_input_tokens(model: &str) -> Option<u64> {
+    match model {
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => Some(922_000),
+        "gpt-5.5" | "gpt-5.4" => Some(922_000),
+        _ => None,
+    }
+}
+
 impl StoredRates {
     fn from_static(rates: Rates) -> Self {
         Self {
@@ -1685,6 +1795,25 @@ Finetuning
             parse_openai_model_threshold("- 1,050,000 context window"),
             None
         );
+    }
+
+    #[test]
+    fn parses_openai_model_input_limit_with_threshold() {
+        let details = parse_openai_model_details(
+            "- Maximum input tokens: 922,000\n- Prompts with >272K input tokens are priced at 2x input",
+        );
+        assert_eq!(details.long_threshold, Some(272_000));
+        assert_eq!(details.max_input_tokens, Some(922_000));
+
+        let derived = parse_openai_model_details(
+            "- 1,050,000 context window\n- 128,000 max output tokens\n- Prompts with >272K input tokens are priced at 2x input",
+        );
+        assert_eq!(derived.max_input_tokens, Some(922_000));
+
+        let prose = parse_openai_model_details(
+            "The model has a context window of 1,050,000 tokens and supports up to 128,000 max output tokens.",
+        );
+        assert_eq!(prose.max_input_tokens, Some(922_000));
     }
 
     #[test]
@@ -1799,6 +1928,7 @@ Finetuning
                     },
                     long: None,
                     long_threshold: None,
+                    max_input_tokens: None,
                 },
                 StoredEntry {
                     id: "gpt-4o-2024-05-13".to_owned(),
@@ -1814,6 +1944,7 @@ Finetuning
                     },
                     long: None,
                     long_threshold: None,
+                    max_input_tokens: None,
                 },
             ],
             &metadata,
@@ -1859,6 +1990,20 @@ Finetuning
                 );
             }
         }
+    }
+
+    #[test]
+    fn pricing_profile_exposes_both_tiers_for_wizard_presets() {
+        let catalog = PricingCatalog::builtin(Protocol::OpenAiResponses);
+        let profile = catalog.pricing_profile("gpt-5.6-sol").unwrap();
+        assert_eq!(profile.official_model, "gpt-5.6-sol");
+        assert_eq!(profile.long_threshold, Some(272_000));
+        assert_eq!(profile.max_input_tokens, Some(922_000));
+        assert_eq!(profile.standard.uncached_input_per_million, decimal("4"));
+        assert_eq!(
+            profile.long.unwrap().uncached_input_per_million,
+            decimal("8")
+        );
     }
 
     #[test]
